@@ -1,28 +1,22 @@
 #!/usr/bin/env python3
 """
-Arm Move To XYZ Skill - Move arm to a Cartesian position using IK.
+Arm Draw Image As Waypoints — traces a raster image on paper using IK waypoints.
 """
 import math
-from typing import Optional, List
-import time
-import sys
 import os
-from dataclasses import dataclass, asdict
-from enum import Enum
 import re
 import tempfile
+from dataclasses import asdict, dataclass
+from enum import Enum
+from pathlib import Path
+from typing import List, Optional
 
+import cv2
 import numpy as np
 import vtracer
-import cv2
 from svgpathtools import svg2paths
-from scipy.spatial.transform import Rotation as R
-import matplotlib.pyplot as plt
 
-
-from typing import List
-from dataclasses import dataclass
-from brain_client.skill_types import Skill, SkillResult, Interface, InterfaceType
+from brain_client.skill_types import Interface, InterfaceType, Skill, SkillResult
 
 class ActionType(Enum):
     WAYPOINT = 0
@@ -75,7 +69,6 @@ def _parse_transform_str(transform_str: str) -> Waypoint:
 
 def _svg_to_paths(svg_path: str) -> List[List[Waypoint]]:
     paths, attributes = svg2paths(svg_path)
-    print(f"Extracted {len(paths)} paths from SVG")
     all_paths = []
     if len(paths) == 0:
         return [[]]
@@ -128,44 +121,58 @@ def produce_waypoints(input_path: str) -> List[Action]:
     return actions
 
 
+_DEFAULT_IMAGE = "draw_waypoints/demo/patrick.png"
+
+
+def _resolve_image_path(relative: str) -> str:
+    """Resolve a demo image path relative to ~/skills or $INNATE_OS_ROOT/skills."""
+    candidates = [
+        Path.home() / "skills" / relative,
+        Path(os.environ.get("INNATE_OS_ROOT", Path.home() / "innate-os")) / "skills" / relative,
+        Path(__file__).resolve().parent / relative,
+    ]
+    for p in candidates:
+        if p.is_file():
+            return str(p)
+    return str(candidates[0])
+
+
 class ArmDrawImageAsWaypoints(Skill):
-    """Move the arm to a Cartesian position using inverse kinematics."""
-    
+    """Trace a raster image on paper as Cartesian arm waypoints."""
+
     manipulation = Interface(InterfaceType.MANIPULATION)
-    
+
     def __init__(self, logger):
         super().__init__(logger)
         self._cancelled = False
-    
+
     @property
     def name(self):
         return "arm_draw_image_as_waypoints"
-    
+
     def guidelines(self):
         return (
-            "Move the arm end-effector to a target position in Cartesian space (x, y, z in meters). "
-            "Coordinates are relative to the robot base_link. Optionally specify roll, pitch, yaw orientation in radians."
+            "Draw an image using the arm. Converts a raster image to SVG paths "
+            "and traces them as Cartesian waypoints on a flat surface beneath the arm. "
+            "Automatically dispatched when arm_mode is set to 'draw'."
         )
-    
+
     def execute(self):
-        """
-        Draw image as waypoints.
-        
-        Args:
-        """
-        image_path = "/home/jetson1/skills/draw_waypoints_utils/demo/patrick.png"
-        tracker_image_path = "/home/jetson1/skills/draw_waypoints_utils/demo/tracker.png"
-        self.logger.info(f"Producing waypoints from image: {image_path}")
+        image_path = _resolve_image_path(_DEFAULT_IMAGE)
+        self.logger.info(f"Drawing from image: {image_path}")
+
+        if not os.path.isfile(image_path):
+            return f"Image not found: {image_path}", SkillResult.FAILURE
+
         actions = produce_waypoints(image_path)
         self.logger.info(f"Produced {len(actions)} actions from image")
-        
-        img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
-        assert img is not None
 
-        ## Produce XYZ waypoints from actions
-        poses: List[ArmPose] = []
-        ## TODO(rbenefo): Figure out how to get to 0 pose.
-        
+        img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            return f"Failed to read image: {image_path}", SkillResult.FAILURE
+
+        img_h, img_w = img.shape[:2]
+
         CAMERA_CAPTURE_X = 0.17
         CAMERA_CAPTURE_Y = 0.0
         CAMERA_CAPTURE_Z = 0.12
@@ -173,65 +180,52 @@ class ArmDrawImageAsWaypoints(Skill):
         CAMERA_CAPTURE_PITCH = 1.52805058
         CAMERA_CAPTURE_YAW = 3.0171064
         LIFT_HEIGHT = CAMERA_CAPTURE_Z
-        
+
         HOME_X = 0.23
         HOME_Y = 0.0
         DOWN_Z = 0.08
-        DOWN_ROLL = 0.0
-        DOWN_PITCH = 0.0
-        DOWN_YAW = 0.0
         DROP_HEIGHT = DOWN_Z
-        
-        patrick_dim = 225
-        workspace_dim = 0.21 # m
 
-        # while True:
-        #     pose = self.manipulation.get_current_end_effector_pose()
-        #     self.logger.info(f"Current end-effector pose: {pose}")
-        #     time.sleep(0.01)
+        workspace_dim = 0.21  # metres
 
-        ## Define initial position.
-        pose = ArmPose(CAMERA_CAPTURE_X, CAMERA_CAPTURE_Y, CAMERA_CAPTURE_Z, CAMERA_CAPTURE_ROLL, CAMERA_CAPTURE_PITCH, CAMERA_CAPTURE_YAW)
+        poses: List[ArmPose] = []
+        pose = ArmPose(
+            CAMERA_CAPTURE_X, CAMERA_CAPTURE_Y, CAMERA_CAPTURE_Z,
+            CAMERA_CAPTURE_ROLL, CAMERA_CAPTURE_PITCH, CAMERA_CAPTURE_YAW,
+        )
         poses.append(pose)
+
         for i, action in enumerate(actions):
+            if self._cancelled:
+                return "Drawing cancelled", SkillResult.CANCELLED
+
             if action.action_type == ActionType.LIFT:
-                pose = ArmPose(pose.x, pose.y, LIFT_HEIGHT, \
-                    CAMERA_CAPTURE_ROLL, CAMERA_CAPTURE_PITCH, CAMERA_CAPTURE_YAW)
-            elif action.action_type == ActionType.DROP:
-                pose = ArmPose(pose.x, pose.y, DROP_HEIGHT,
-                    0.0, 0.0, 0.0)
-            elif action.action_type == ActionType.WAYPOINT:                
-                ## Actions are in pixel coordinates.
-                ## Patrick is 225 x 225
-                normalized_waypoint = Waypoint(
-                    x=action.waypoint.x / patrick_dim,  # Center at (0, 0)
-                    y=action.waypoint.y / patrick_dim
+                pose = ArmPose(
+                    pose.x, pose.y, LIFT_HEIGHT,
+                    CAMERA_CAPTURE_ROLL, CAMERA_CAPTURE_PITCH, CAMERA_CAPTURE_YAW,
                 )
-                self.logger.info(f"Normalized waypoint: ({normalized_waypoint.x}, {normalized_waypoint.y})")
-                waypoint = Waypoint(
-                    x=normalized_waypoint.x * workspace_dim,  # Scale to fit in 20cm x 20cm area
-                    y=normalized_waypoint.y * workspace_dim
+            elif action.action_type == ActionType.DROP:
+                pose = ArmPose(pose.x, pose.y, DROP_HEIGHT, 0.0, 0.0, 0.0)
+            elif action.action_type == ActionType.WAYPOINT:
+                norm = Waypoint(
+                    x=action.waypoint.x / img_w,
+                    y=action.waypoint.y / img_h,
                 )
                 pose = ArmPose(
-                    x=HOME_X + waypoint.x,
-                    y=HOME_Y + waypoint.y,
+                    x=HOME_X + norm.x * workspace_dim,
+                    y=HOME_Y + norm.y * workspace_dim,
                     z=pose.z,
-                    roll=0.0,
-                    pitch=0.0,
-                    yaw=0.0
+                    roll=0.0, pitch=0.0, yaw=0.0,
                 )
-            else:
-                raise ValueError("Uh oh. Invalid action??")
-            
+
             if action.action_type == ActionType.WAYPOINT and i % 10 == 0:
-                ## Only run every 10th waypoint to make the robot faster.
-                self.logger.info(f"Generated pose for action {i}/{len(actions)}: ({pose.x}, {pose.y}, {pose.z})")
                 poses.append(pose)
             elif action.action_type != ActionType.WAYPOINT:
                 poses.append(pose)
-            
+
+        self.logger.info(f"Sending {len(poses)} IK poses to arm")
         poses_dicts = [asdict(pose) for pose in poses]
-        
+
         success = self.manipulation.move_cartesian_trajectory(
             poses=poses_dicts,
             segment_duration=0.5,
@@ -239,33 +233,9 @@ class ArmDrawImageAsWaypoints(Skill):
 
         if not success:
             return "Failed to solve IK or send arm command", SkillResult.FAILURE
-     
+
         return "Successfully drew image", SkillResult.SUCCESS
-    
+
     def cancel(self):
-        """Cancel the arm movement."""
         self._cancelled = True
-        return "Arm motion cancelled"
-
-def visualize_actions(image: cv2.Mat, actions: List[Action], curr_pos: ArmPose, duration: float, out_path: str):
-    plt.figure()
-    plt.imshow(image, cmap='gray')
-    n = len(actions)
-
-    for i, action in enumerate(actions):
-        if action.action_type == ActionType.WAYPOINT:
-            xs = [action.waypoint.x]
-            ys = [action.waypoint.y]
-            plt.plot(xs, ys, 'o', color = "green")
-    plt.scatter([curr_pos.x], [curr_pos.y], marker='x', color = "red")
-    plt.title("Next action in: {:.1f}s".format(duration))
-            
-    plt.savefig(out_path)
-    
-def estimate_duration(target_pos: ArmPose, curr_pos: ArmPose) -> float:
-    ## Just focus on translation, not rotation for now.
-    max_speed = 0.5 # m/s, super rough estimate
-    target_position = np.array([target_pos.x, target_pos.y, target_pos.z])
-    curr_position = np.array([curr_pos.x, curr_pos.y, curr_pos.z])
-    distance = np.linalg.norm(target_position - curr_position)
-    return distance / max_speed
+        return "Drawing cancelled"
