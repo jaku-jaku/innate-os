@@ -1108,11 +1108,16 @@ class BrainClientNode(Node):
 
     def tts_callback(self, msg: String):
         """Handle direct TTS requests from /brain/tts topic."""
-
         text = msg.data
-        if text and text.strip():
-            self.get_logger().info(f"TTS request received: {text[:50]}...")
-            self._speak(text)
+        if not text:
+            return
+        if not text.strip():
+            # Empty string is the "clear queue" sentinel sent by brain-rot before a new batch.
+            if hasattr(self, "tts_handler") and self.tts_handler is not None:
+                self.tts_handler.clear_queue()
+            return
+        self.get_logger().info(f"TTS request received: {text[:50]}...")
+        self._speak(text)
 
     def custom_input_callback(self, msg: String):
         """Handle custom input data from input_manager."""
