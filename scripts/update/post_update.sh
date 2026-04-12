@@ -716,6 +716,18 @@ for meta_file in "$REPO_DIR"/skills/*/metadata.json; do
 done
 
 # -----------------------------------------------------------------------------
+# 11c. Set default startup directive (enables mic at boot)
+# -----------------------------------------------------------------------------
+DIRECTIVE_FILE="$REPO_DIR/.directive_on_startup"
+if [ ! -f "$DIRECTIVE_FILE" ]; then
+    log "Creating default startup directive: basic_agent"
+    echo "basic_agent" > "$DIRECTIVE_FILE"
+    chown "$ACTUAL_USER:$ACTUAL_USER" "$DIRECTIVE_FILE"
+else
+    log "Startup directive already configured: $(cat "$DIRECTIVE_FILE")"
+fi
+
+# -----------------------------------------------------------------------------
 # 12. Enable and restart services
 # -----------------------------------------------------------------------------
 log "Enabling and starting services..."

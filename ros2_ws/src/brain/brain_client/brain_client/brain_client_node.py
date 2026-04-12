@@ -392,9 +392,17 @@ class BrainClientNode(Node):
         self.custom_input_sub = self.create_subscription(
             String, "/input_manager/custom", self.custom_input_callback, 10
         )
-        # Publisher to tell input_manager which inputs should be active
+        # Publisher to tell input_manager which inputs should be active.
+        # TransientLocal durability acts as a "last value cache": any subscriber
+        # that connects after the publish (e.g. input_manager_node starting later)
+        # will immediately receive the most recent message instead of missing it.
+        _active_inputs_qos = QoSProfile(
+            depth=1,
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+        )
         self.active_inputs_pub = self.create_publisher(
-            String, "/input_manager/active_inputs", 10
+            String, "/input_manager/active_inputs", _active_inputs_qos
         )
         # Ensure all inputs (STT, etc.) are off on startup; they'll be activated
         # when the brain activates via activate_directive_inputs().

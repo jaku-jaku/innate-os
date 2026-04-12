@@ -16,6 +16,7 @@ import os
 import time
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSDurabilityPolicy
 from std_msgs.msg import String
 from std_srvs.srv import SetBool
 import json
@@ -126,12 +127,19 @@ class InputManagerNode(Node):
         self.chat_in_pub = self.create_publisher(String, '/brain/chat_in', 10)
         self.custom_pub = self.create_publisher(String, '/input_manager/custom', 10)
         
-        # Subscribe to active inputs list from brain_client
+        # Subscribe to active inputs list from brain_client.
+        # Must use matching TransientLocal QoS so we receive the cached value
+        # even if brain_client_node published before we started.
+        _active_inputs_qos = QoSProfile(
+            depth=1,
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+        )
         self.active_inputs_sub = self.create_subscription(
             String,
             '/input_manager/active_inputs',
             self.handle_active_inputs,
-            10
+            _active_inputs_qos
         )
         
         # Subscribe to TTS status for ducking (suppress mic while robot speaks)
