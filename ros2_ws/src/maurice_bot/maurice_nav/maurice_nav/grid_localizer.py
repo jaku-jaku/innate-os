@@ -31,8 +31,8 @@ from typing import Optional
 
 import numpy as np
 import rclpy
-from rclpy.executors import ExternalShutdownException
-from rclpy.executors import SingleThreadedExecutor
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 from rclpy.lifecycle import Node
 from rclpy.lifecycle import Publisher
 from rclpy.lifecycle import State
@@ -55,7 +55,6 @@ class GridLocalizer(Node):
     map_sub: Optional[rclpy.subscription.Subscription] = None
     pose_pub: Optional[Publisher] = None
     status_pub: Optional[Publisher] = None
-    srv = None
     _auto_timer = None
     _map_check_timer = None
     
@@ -78,7 +77,9 @@ class GridLocalizer(Node):
     _auto_localize_enabled: bool = False
     
     # Node state tracking
+    _is_configured: bool = False
     _is_active: bool = False
+    _localizing: bool = False
     
     # Parameters (declared in on_configure)
     sample_dist = None
@@ -90,6 +91,16 @@ class GridLocalizer(Node):
     
     def __init__(self, node_name='grid_localizer', **kwargs):
         super().__init__(node_name, **kwargs)
+        # Service lives in __init__ (not on_configure) so it always exists in
+        # the ROS graph.  Rosbridge call_service will never hang waiting for a
+        # server that doesn't exist; the callback returns an immediate error
+        # when the node isn't configured/active.
+        self._srv_group = MutuallyExclusiveCallbackGroup()
+        self.srv = self.create_service(
+            Trigger, 'localize', self._localize_cb,
+            callback_group=self._srv_group,
+        )
+
     def on_configure(self, state: State) -> TransitionCallbackReturn:
         """Unconfigured → Inactive: Declare parameters and create resources."""
         # Parameters - only declare if first one doesn't exist
@@ -147,11 +158,9 @@ class GridLocalizer(Node):
         self.pose_pub = self.create_lifecycle_publisher(PoseWithCovarianceStamped, '/initialpose', latched_qos)
         self.status_pub = self.create_lifecycle_publisher(String, '/localization/status', 10)
         
-        # Service (manual trigger)
-        self.srv = self.create_service(Trigger, 'localize', self._localize_cb)
-        
         # Store auto_localize setting for use in on_activate
         self._auto_localize_enabled = auto_localize
+        self._is_configured = True
         
         self.get_logger().info('Grid localizer configured. Waiting for map...')
         
@@ -194,6 +203,8 @@ class GridLocalizer(Node):
     def _cleanup_resources(self):
         """Helper method to clean up all node resources."""
         self.get_logger().info('Attempting to clean up Grid Localizer')
+        self._is_configured = False
+
         # Destroy timers
         if self._auto_timer:
             self.destroy_timer(self._auto_timer)
@@ -201,11 +212,6 @@ class GridLocalizer(Node):
         if self._map_check_timer:
             self.destroy_timer(self._map_check_timer)
             self._map_check_timer = None
-        
-        # Destroy service
-        if self.srv:
-            self.destroy_service(self.srv)
-            self.srv = None
 
         # Destroy publishers
         if self.pose_pub:
@@ -509,10 +515,19 @@ class GridLocalizer(Node):
 
     def _localize_cb(self, request, response):
         """Service callback to trigger localization."""
-        # Check if node is active
+        if not self._is_configured:
+            response.success = False
+            response.message = 'Node not configured — is navigation mode active?'
+            return response
+
         if not self._is_active:
             response.success = False
-            response.message = 'Node not active'
+            response.message = 'Node not active — is navigation mode active?'
+            return response
+
+        if self._localizing:
+            response.success = False
+            response.message = 'Localization already in progress'
             return response
         
         if not self.map_received:
@@ -525,8 +540,10 @@ class GridLocalizer(Node):
             response.message = 'No scan received yet'
             return response
         
+        self._localizing = True
         try:
-            pose, score = self._find_pose(self.latest_scan)
+            scan_snapshot = self.latest_scan
+            pose, score = self._find_pose(scan_snapshot)
             
             self._publish_pose(pose[0], pose[1], pose[2])
             
@@ -538,6 +555,8 @@ class GridLocalizer(Node):
             response.success = False
             response.message = str(e)
             self.get_logger().error(f'Localization failed: {e}')
+        finally:
+            self._localizing = False
         
         return response
 
@@ -657,8 +676,13 @@ class GridLocalizer(Node):
 def main(args=None):
     rclpy.init(args=args)
     lc_node = GridLocalizer('grid_localizer')
+    # MultiThreadedExecutor lets the localize service (its own callback group)
+    # run on a separate thread so heavy GPU work doesn't starve scan/map
+    # callbacks in the default group.
+    executor = MultiThreadedExecutor(num_threads=2)
+    executor.add_node(lc_node)
     try:
-        rclpy.spin(lc_node)
+        executor.spin()
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
