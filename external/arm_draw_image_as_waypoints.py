@@ -7,7 +7,7 @@ from typing import Optional, List
 import time
 import sys
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from enum import Enum
 import re
 import tempfile
@@ -193,7 +193,7 @@ class ArmDrawImageAsWaypoints(Skill):
         ## Define initial position.
         pose = ArmPose(CAMERA_CAPTURE_X, CAMERA_CAPTURE_Y, CAMERA_CAPTURE_Z, CAMERA_CAPTURE_ROLL, CAMERA_CAPTURE_PITCH, CAMERA_CAPTURE_YAW)
         poses.append(pose)
-        for action in actions:
+        for i, action in enumerate(actions):
             if action.action_type == ActionType.LIFT:
                 pose = ArmPose(pose.x, pose.y, LIFT_HEIGHT, \
                     CAMERA_CAPTURE_ROLL, CAMERA_CAPTURE_PITCH, CAMERA_CAPTURE_YAW)
@@ -222,42 +222,23 @@ class ArmDrawImageAsWaypoints(Skill):
                 )
             else:
                 raise ValueError("Uh oh. Invalid action??")
-            poses.append(pose)
             
+            if action.action_type == ActionType.WAYPOINT and i % 10 == 0:
+                ## Only run every 10th waypoint to make the robot faster.
+                self.logger.info(f"Generated pose for action {i}/{len(actions)}: ({pose.x}, {pose.y}, {pose.z})")
+                poses.append(pose)
+            elif action.action_type != ActionType.WAYPOINT:
+                poses.append(pose)
+            
+        poses_dicts = [asdict(pose) for pose in poses]
         
-        for i, pose in enumerate(poses):
-            # if i != 0 and i % 5 != 0:
-            #     continue ## Skip some waypoints to speed up execution.
-            log_info = f"Attempting to move arm to XYZ ({pose.x}, {pose.y}, {pose.z})."
-            
-            curr_pos = self.manipulation.get_current_end_effector_pose()
-            if curr_pos is not None:
-                curr_postion = curr_pos['position']
-                curr_arm_pos = ArmPose(curr_postion['x'], curr_postion['y'], curr_postion['z'], 0.0, 0.0, 0.0)
-                log_info += " Current arm position is XYZ ({:.3f}, {:.3f}, {:.3f}).".format(curr_arm_pos.x, curr_arm_pos.y, curr_arm_pos.z)
-                duration=estimate_duration(pose, curr_arm_pos)
-            else:
-                duration = 5.0
-            self.logger.info(log_info)
+        success = self.manipulation.move_cartesian_trajectory(
+            poses=poses_dicts,
+            segment_duration=0.5,
+        )
 
-            duration = max(duration, 0.1)
-            if i != 0 and curr_pos is not None:
-                ## Hack: Skip the first index, since it's the initial position.
-                scaled_arm_pos = ArmPose((curr_arm_pos.x- HOME_X) / workspace_dim * patrick_dim, 
-                                         (curr_arm_pos.y- HOME_Y) / workspace_dim * patrick_dim, 
-                                         0.0, 0.0, 0.0, 0.0) # Skip z, not needed for image viz.
-                visualize_actions(img, actions[:i - 1], scaled_arm_pos, duration, tracker_image_path)
-
-            result = self._execute_pose(
-                x=pose.x, y=pose.y, z=pose.z,
-                roll=pose.roll, pitch=pose.pitch, yaw=pose.yaw,
-                duration=duration,
-                timeout=duration * 2.0,
-            )
-            if result[1] != SkillResult.SUCCESS:
-                self.logger.error(
-                    f"Failed to move to waypoint ({pose.x}, {pose.y}, {pose.z}) with result: {result[0]}"
-                )
+        if not success:
+            return "Failed to solve IK or send arm command", SkillResult.FAILURE
      
         return "Successfully drew image", SkillResult.SUCCESS
     
@@ -265,94 +246,6 @@ class ArmDrawImageAsWaypoints(Skill):
         """Cancel the arm movement."""
         self._cancelled = True
         return "Arm motion cancelled"
-
-
-    def _execute_pose(
-        self,
-        x: float,
-        y: float,
-        z: float,
-        roll: float = 0.0,
-        pitch: float = 0.0,
-        yaw: float = 0.0,
-        pos_tolerance: float = 0.2,
-        angle_tolerance: float = 0.1, # rad, approx ~5°
-        duration: float= 5.0,
-        timeout: float = 10.0,
-    ):
-        """
-        Move arm to Cartesian pose using IK.
-        
-        Args:
-            x: Target x position in meters (forward from base)
-            y: Target y position in meters (left from base)
-            z: Target z position in meters (up from base)
-            roll: Target roll orientation in radians
-            pitch: Target pitch orientation in radians
-            yaw: Target yaw orientation in radians
-            duration: Motion duration in seconds
-        """
-        self._cancelled = False
-        
-        if self.manipulation is None:
-            print("Manipulation interface not available!")
-            return "Manipulation interface not available", SkillResult.FAILURE
-        
-        self.logger.info(
-            f"Moving arm to XYZ ({x}, {y}, {z}) with RPY ({roll}, {pitch}, {yaw}) and duration: {duration}"
-        )
-        
-        success = self.manipulation.move_to_cartesian_pose(
-            x=x, y=y, z=z,
-            roll=roll, pitch=pitch, yaw=yaw,
-            duration=duration
-        )
-
-        if not success:
-            return "Failed to solve IK or send arm command", SkillResult.FAILURE
-        
-        # Wait for motion to complete (with cancellation check)
-        start_time = time.time()
-        while True:
-            curr_pos = self.manipulation.get_current_end_effector_pose()
-            position = curr_pos['position']
-            curr_position = np.array([position['x'], position['y'], position['z']])
-            target_pos = np.array([x, y, z])
-
-            rel_pos = target_pos - curr_position
-            curr_orientation = curr_pos['orientation']
-            curr_quat = R.from_quat([
-                curr_orientation['x'],
-                curr_orientation['y'],
-                curr_orientation['z'],
-                curr_orientation['w']
-            ])
-            target_quat = R.from_euler('xyz', [roll, pitch, yaw])
-            rel_angle = compute_rel_angle(target_quat, curr_quat)
-            
-            time_elapsed = time.time() - start_time
-            if time_elapsed > timeout:
-                error = f"Timed out after {timeout} seconds while moving. Final pos: ({curr_position[0]}, {curr_position[1]}, {curr_position[2]})"
-                self.logger.error(error)
-                return error, SkillResult.FAILURE
-            
-            if self._cancelled:
-                return "Arm motion cancelled", SkillResult.CANCELLED
-
-            time.sleep(0.1)
-            if (rel_pos < pos_tolerance).all() and rel_angle < angle_tolerance:
-                return f"Arm moved to ({x}, {y}, {z})", SkillResult.SUCCESS   
-        error = f"Failed to reach target within tolerances. Final pos: ({curr_pos[0]}, {curr_pos[1]}, {curr_pos[2]}), target pos: ({x}, {y}, {z}), rel pos: ({rel_pos[0]}, {rel_pos[1]}, {rel_pos[2]}), rel angle: {rel_angle}"
-        self.logger.error(error)
-        return error, SkillResult.FAILURE
-
-
-def compute_rel_angle(angla_a: R, angle_b: R) -> float:
-    r_rel = angla_a * angle_b.inv()
-    # angle of rotation (in radians)
-    angle = r_rel.magnitude()
-    return angle
-
 
 def visualize_actions(image: cv2.Mat, actions: List[Action], curr_pos: ArmPose, duration: float, out_path: str):
     plt.figure()
