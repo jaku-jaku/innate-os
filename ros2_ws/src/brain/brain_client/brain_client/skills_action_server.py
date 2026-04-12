@@ -161,6 +161,9 @@ class SkillsActionServer(Node):
         # Create service for reloading skills
         self._reload_srv = self.create_service(Trigger, "/brain/reload_primitives", self._handle_reload_skills)
 
+        # Create service for emergency stop
+        self._estop_srv = self.create_service(Trigger, "/brain/estop", self._handle_estop)
+
         # Create service for creating new physical skills
         self._create_physical_skill_srv = self.create_service(
             CreatePhysicalSkill,
@@ -431,6 +434,65 @@ class SkillsActionServer(Node):
         except Exception as e:
             response.success = False
             response.message = f"Failed to reload skills: {e}"
+        return response
+
+    def _handle_estop(self, request, response):
+        """Service handler for emergency stop (/brain/estop).
+
+        Immediately:
+          1. Requests cancellation of the currently running skill.
+          2. Publishes zero cmd_vel to stop the base.
+          3. Sends an async arm torque-off request (fire-and-forget to avoid
+             deadlocking the single-threaded spin_once executor).
+        """
+        self.get_logger().warn("[ESTOP] Emergency stop triggered!")
+
+        # Cancel the currently running skill.
+        with self._current_skill_lock:
+            current_skill = self._current_skill
+        if current_skill is not None:
+            try:
+                current_skill.cancel()
+                self.get_logger().info("[ESTOP] Current skill cancel requested")
+            except Exception as e:
+                self.get_logger().error(f"[ESTOP] Error cancelling skill: {e}")
+
+        # Belt-and-suspenders: cancel every loaded code skill.
+        with self._skills_lock:
+            all_code = list(self._code_skills.values())
+        for _name, skill in all_code:
+            try:
+                skill.cancel()
+            except Exception:
+                pass
+
+        # Publish zero velocity to stop the base immediately.
+        try:
+            self.mobility.send_cmd_vel(0.0, 0.0)
+            # Disarm any scheduled auto-stop timer so it doesn't interfere.
+            if self.mobility._stop_timer is not None:
+                try:
+                    self.mobility._stop_timer.cancel()
+                except Exception:
+                    pass
+                self.mobility._stop_timer = None
+            self.get_logger().info("[ESTOP] Zero cmd_vel published")
+        except Exception as e:
+            self.get_logger().error(f"[ESTOP] Mobility stop error: {e}")
+
+        # Request arm torque off asynchronously (avoid spin_until_future_complete
+        # here to prevent deadlocking the single-threaded spin_once loop).
+        try:
+            if self.manipulation._torque_off_client.service_is_ready():
+                self.manipulation._torque_off_client.call_async(Trigger.Request())
+                self.get_logger().info("[ESTOP] Arm torque-off requested (async)")
+            else:
+                self.get_logger().warn("[ESTOP] Arm torque-off service not ready")
+        except Exception as e:
+            self.get_logger().error(f"[ESTOP] Arm torque-off error: {e}")
+
+        response.success = True
+        response.message = "E-STOP executed: base stopped, arm torque-off requested"
         return response
 
     def _handle_create_physical_skill(self, request, response):
