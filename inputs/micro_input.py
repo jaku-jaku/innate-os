@@ -10,6 +10,7 @@ Uses proxy services via self.proxy (injected by InputManager).
 import base64
 import json
 import queue
+import struct
 import threading
 import time
 from typing import Optional
@@ -58,6 +59,11 @@ class MicroInput(InputDevice):
         self._ipc_socket = None
         self._ipc_queue: "queue.Queue[bytes | None]" = queue.Queue(maxsize=256)
         self._ipc_thread: Optional[threading.Thread] = None
+        # Optional UDP stream (AUD1 + PCM) to robot-gateway on another host
+        self._udp_socket = None
+        self._udp_addr = None
+        self._udp_queue: "queue.Queue[bytes | None]" = queue.Queue(maxsize=256)
+        self._udp_thread: Optional[threading.Thread] = None
         # Initialize logger wrapper (will be updated when set_logger is called)
         self.logger = UniversalLogger(enabled=False)
     
@@ -188,6 +194,68 @@ class MicroInput(InputDevice):
         self._ipc_thread = threading.Thread(target=ipc_sender, daemon=True)
         self._ipc_thread.start()
 
+    def _start_udp_audio_sender(self):
+        """
+        If proxy.config contains 'robot_gateway_audio_udp' (e.g. '192.168.1.50:9850'),
+        send mic PCM as UDP datagrams: AUD1 (4) + sample_rate u32 LE + raw s16le mono.
+        Matches robot-gateway `ipc.audio_udp` ingest (no TCP/base64 overhead).
+        """
+        dest = (self.proxy.config.get('robot_gateway_audio_udp', '') or '') if self.proxy else ''
+        dest = dest.strip()
+        if not dest:
+            return
+
+        import socket
+        host, _, port_str = dest.rpartition(':')
+        if not host or not port_str.isdigit():
+            self.logger.error(f"❌ robot_gateway_audio_udp must be host:port, got {dest!r}")
+            return
+        try:
+            port = int(port_str)
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self._udp_socket = sock
+            self._udp_addr = (host, port)
+            self.logger.info(f"🔗 Audio UDP stream → {host}:{port} (AUD1 + PCM)")
+        except Exception as e:
+            self.logger.error(f"❌ Audio UDP setup failed ({dest}): {e}")
+            return
+
+        def udp_sender():
+            sock = self._udp_socket
+            addr = self._udp_addr
+            hdr = b"AUD1" + struct.pack("<I", DEFAULT_SAMPLE_RATE)
+            while not self._stop_evt.is_set():
+                try:
+                    chunk = self._udp_queue.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                if chunk is None:
+                    break
+                try:
+                    sock.sendto(hdr + chunk, addr)
+                except Exception as e:
+                    if not self._stop_evt.is_set():
+                        self.logger.error(f"Audio UDP send error: {e}")
+                    break
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+        self._udp_thread = threading.Thread(target=udp_sender, daemon=True)
+        self._udp_thread.start()
+
+    def _stop_udp_audio_sender(self):
+        try:
+            self._udp_queue.put_nowait(None)
+        except queue.Full:
+            pass
+        if self._udp_thread:
+            self._udp_thread.join(timeout=1.0)
+            self._udp_thread = None
+        self._udp_socket = None
+        self._udp_addr = None
+
     def _stop_ipc_audio_sender(self):
         """Shut down the IPC audio sender thread."""
         try:
@@ -231,6 +299,8 @@ class MicroInput(InputDevice):
             
             # Start optional raw-audio IPC stream to robot-gateway (for brain-rot).
             self._start_ipc_audio_sender()
+            # Optional LAN-friendly UDP stream (same PCM feed; set robot_gateway_audio_udp on Jetson).
+            self._start_udp_audio_sender()
 
             # Connect via proxy
             self._connect_via_proxy()
@@ -443,6 +513,12 @@ class MicroInput(InputDevice):
                         except queue.Full:
                             pass
 
+                    if self._udp_socket and self._udp_addr:
+                        try:
+                            self._udp_queue.put_nowait(chunk)
+                        except queue.Full:
+                            pass
+
                     # Log periodically (much less frequently)
                     if chunks_sent == 100:
                         self.logger.info(f"🎧 Streaming audio ({chunks_sent} chunks)")
@@ -479,6 +555,7 @@ class MicroInput(InputDevice):
             self.client = None
 
         self._stop_ipc_audio_sender()
+        self._stop_udp_audio_sender()
 
     def _detect_audio_device(self):
         """Detect and list available audio capture devices."""

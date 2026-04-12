@@ -58,6 +58,12 @@ class InputManagerNode(Node):
             "robot_gateway_ipc",
             os.environ.get("ROBOT_GATEWAY_IPC", "127.0.0.1:9842"),
         )
+        # Optional UDP destination host:port (e.g. dev laptop running robot-gateway with ipc.audio_udp).
+        # Binary AUD1+PCM — better over LAN than TCP NDJSON/base64. Env: ROBOT_GATEWAY_AUDIO_UDP
+        self.declare_parameter(
+            "robot_gateway_audio_udp",
+            os.environ.get("ROBOT_GATEWAY_AUDIO_UDP", ""),
+        )
         
         # Build config dict from params
         proxy_config = {
@@ -66,6 +72,7 @@ class InputManagerNode(Node):
             "openai_transcribe_model": self.get_parameter("openai_transcribe_model").value,
             "cartesia_voice_id": self.get_parameter("cartesia_voice_id").value,
             "robot_gateway_ipc": self.get_parameter("robot_gateway_ipc").value,
+            "robot_gateway_audio_udp": self.get_parameter("robot_gateway_audio_udp").value,
         }
         
         # Create proxy client (credentials from env, config from params)
