@@ -52,6 +52,12 @@ class InputManagerNode(Node):
         self.declare_parameter("openai_realtime_url", "wss://api.openai.com/v1/realtime")
         self.declare_parameter("openai_transcribe_model", "gpt-4o-mini-transcribe")
         self.declare_parameter("cartesia_voice_id", "f786b574-daa5-4673-aa0c-cbe3e8534c02")
+        # Address of robot-gateway telemetry IPC; when set, micro_input streams
+        # raw PCM to the gateway so brain-rot can use audio as Gemini input.
+        self.declare_parameter(
+            "robot_gateway_ipc",
+            os.environ.get("ROBOT_GATEWAY_IPC", "127.0.0.1:9842"),
+        )
         
         # Build config dict from params
         proxy_config = {
@@ -59,6 +65,7 @@ class InputManagerNode(Node):
             "openai_realtime_url": self.get_parameter("openai_realtime_url").value,
             "openai_transcribe_model": self.get_parameter("openai_transcribe_model").value,
             "cartesia_voice_id": self.get_parameter("cartesia_voice_id").value,
+            "robot_gateway_ipc": self.get_parameter("robot_gateway_ipc").value,
         }
         
         # Create proxy client (credentials from env, config from params)

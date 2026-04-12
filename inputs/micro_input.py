@@ -39,6 +39,9 @@ class MicroInput(InputDevice):
     Automatically reconnects if WebSocket connection is lost.
     """
 
+    # Seconds to keep suppressing audio after TTS ends (covers speaker echo/reverb)
+    POST_TTS_GUARD_SEC = 0.4
+
     def __init__(self):
         super().__init__()
         self.mic = None
@@ -46,10 +49,15 @@ class MicroInput(InputDevice):
         self._stop_evt = threading.Event()
         self._audio_thread = None
         self._is_robot_talking = False  # For ducking (mic-specific)
+        self._tts_ended_at: float = 0.0  # Timestamp when TTS last stopped
         self._reconnect_thread = None
         self._is_connected = False
         self._reconnect_delay = 1  # Start with 1 second
         self._max_reconnect_delay = 30  # Max 30 seconds between retries
+        # Optional parallel raw-audio stream to robot-gateway IPC
+        self._ipc_socket = None
+        self._ipc_queue: "queue.Queue[bytes | None]" = queue.Queue(maxsize=256)
+        self._ipc_thread: Optional[threading.Thread] = None
         # Initialize logger wrapper (will be updated when set_logger is called)
         self.logger = UniversalLogger(enabled=False)
     
@@ -66,13 +74,135 @@ class MicroInput(InputDevice):
     def set_tts_playing(self, is_playing: bool):
         """
         Called when TTS (text-to-speech) status changes.
-        
+
         Implements "ducking" - suppressing mic input while robot speaks.
-        
+        When TTS ends we flush any buffered audio so the robot can't
+        transcribe its own voice from the tail of the speaker output.
+
         Args:
             is_playing: True if robot is speaking, False otherwise
         """
+        was_talking = self._is_robot_talking
         self._is_robot_talking = is_playing
+
+        if was_talking and not is_playing:
+            # TTS just ended: drain stale audio that accumulated while the
+            # speaker was playing (would otherwise be transcribed as "self").
+            self._flush_audio_queue()
+            # Record the time so the audio loop can enforce a post-TTS guard.
+            self._tts_ended_at = time.time()
+
+    def _flush_audio_queue(self):
+        """
+        Drain all buffered microphone audio.
+
+        Called when TTS playback ends so we discard PCM that was captured
+        while the speaker was active.  We also tell OpenAI to clear its
+        server-side input buffer so it won't transcribe audio from before
+        the flush.
+        """
+        drained = 0
+        if self.mic:
+            while not self.mic.queue.empty():
+                try:
+                    self.mic.queue.get_nowait()
+                    drained += 1
+                except queue.Empty:
+                    break
+        if drained:
+            self.logger.info(f"🧹 Flushed {drained} stale audio chunks after TTS")
+
+        # Ask the Realtime API to discard its pending input buffer too.
+        if self._is_connected and self.client:
+            try:
+                self.client.send_json({"type": "input_audio_buffer.clear"})
+            except Exception:
+                pass
+
+    def _is_ducked(self) -> bool:
+        """
+        Return True if audio should be suppressed right now.
+
+        True while the robot is speaking, and for POST_TTS_GUARD_SEC
+        afterwards to absorb speaker echo/reverb picked up by the mic.
+        """
+        if self._is_robot_talking:
+            return True
+        return (time.time() - self._tts_ended_at) < self.POST_TTS_GUARD_SEC
+
+    # ------------------------------------------------------------------
+    # Parallel raw-audio IPC sender (feeds robot-gateway → brain-rot)
+    # ------------------------------------------------------------------
+
+    def _start_ipc_audio_sender(self):
+        """
+        If proxy.config contains 'robot_gateway_ipc' (e.g. '127.0.0.1:9842'),
+        open a TCP connection to robot-gateway and start a thread that sends
+        raw PCM chunks as NDJSON:
+            {"op":"audio_chunk","sample_rate":24000,"data":"<base64>"}
+        Gateway re-broadcasts these as channel:"audio" to all other IPC clients,
+        where brain-rot accumulates them into its audio ring buffer.
+        """
+        ipc_addr = (self.proxy.config.get('robot_gateway_ipc', '') or '') if self.proxy else ''
+        if not ipc_addr:
+            return
+
+        import socket
+        try:
+            host, _, port_str = ipc_addr.rpartition(':')
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.connect((host, int(port_str)))
+            sock.settimeout(2.0)
+            self._ipc_socket = sock
+            self.logger.info(f"🔗 Audio IPC stream connected to robot-gateway {ipc_addr}")
+        except Exception as e:
+            self.logger.error(f"❌ Audio IPC connect failed ({ipc_addr}): {e}")
+            return
+
+        def ipc_sender():
+            sock = self._ipc_socket
+            while not self._stop_evt.is_set():
+                try:
+                    chunk = self._ipc_queue.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                if chunk is None:
+                    break
+                try:
+                    payload = {
+                        "op": "audio_chunk",
+                        "sample_rate": DEFAULT_SAMPLE_RATE,
+                        "data": base64.b64encode(chunk).decode("ascii"),
+                    }
+                    line = json.dumps(payload) + "\n"
+                    sock.sendall(line.encode("utf-8"))
+                except Exception as e:
+                    if not self._stop_evt.is_set():
+                        self.logger.error(f"Audio IPC send error: {e}")
+                    break
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+        self._ipc_thread = threading.Thread(target=ipc_sender, daemon=True)
+        self._ipc_thread.start()
+
+    def _stop_ipc_audio_sender(self):
+        """Shut down the IPC audio sender thread."""
+        try:
+            self._ipc_queue.put_nowait(None)
+        except queue.Full:
+            pass
+        if self._ipc_thread:
+            self._ipc_thread.join(timeout=1.0)
+            self._ipc_thread = None
+        if self._ipc_socket:
+            try:
+                self._ipc_socket.close()
+            except Exception:
+                pass
+            self._ipc_socket = None
 
     def on_open(self):
         """Start microphone and connect to OpenAI via proxy."""
@@ -99,6 +229,9 @@ class MicroInput(InputDevice):
             
             self.logger.info(f"🎙️ Microphone started (rate: {DEFAULT_SAMPLE_RATE}, channels: {DEFAULT_CHANNELS})")
             
+            # Start optional raw-audio IPC stream to robot-gateway (for brain-rot).
+            self._start_ipc_audio_sender()
+
             # Connect via proxy
             self._connect_via_proxy()
                 
@@ -288,8 +421,8 @@ class MicroInput(InputDevice):
                     if not self._is_connected:
                         continue
                     
-                    # Skip sending while ducking (robot is speaking)
-                    if self._is_robot_talking:
+                    # Skip sending while ducking (robot is speaking or echo guard)
+                    if self._is_ducked():
                         if not ducking_logged:
                             self.logger.info("🔇 Ducking active - not sending audio")
                         ducking_logged = True
@@ -302,6 +435,13 @@ class MicroInput(InputDevice):
                     }
                     self.client.send_json(payload)
                     chunks_sent += 1
+
+                    # Fan out to IPC queue for parallel robot-gateway stream (brain-rot).
+                    if self._ipc_socket:
+                        try:
+                            self._ipc_queue.put_nowait(chunk)
+                        except queue.Full:
+                            pass
 
                     # Log periodically (much less frequently)
                     if chunks_sent == 100:
@@ -337,6 +477,8 @@ class MicroInput(InputDevice):
         if self.client:
             self.client.stop()
             self.client = None
+
+        self._stop_ipc_audio_sender()
 
     def _detect_audio_device(self):
         """Detect and list available audio capture devices."""
