@@ -30,7 +30,7 @@ class SecurityGuardAgent(Agent):
 
     def get_inputs(self) -> List[str]:
         """Enable microphone input to hear user"""
-        return ["micro"]
+        return ["whisper_api"]
 
     def get_prompt(self) -> str:
         return """You are a security guard robot tasked with patrolling the house to detect potential intruders. You have a vigilant and professional personality.

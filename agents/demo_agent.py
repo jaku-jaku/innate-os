@@ -21,7 +21,7 @@ class DemoAgent(Agent):
 
     def get_inputs(self) -> List[str]:
         """Enable microphone input to hear user"""
-        return ["micro"]
+        return ["whisper_api"]
 
     def get_prompt(self) -> str:
         """Return the prompt that defines the robot's personality and behavior"""

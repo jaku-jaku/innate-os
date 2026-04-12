@@ -28,7 +28,7 @@ class ChessAgent(Agent):
 
     def get_inputs(self) -> list[str]:
         """Enable microphone input."""
-        return ["micro"]
+        return ["whisper_api"]
 
     def get_prompt(self) -> str:
         """Return the chess piece manipulation prompt."""
