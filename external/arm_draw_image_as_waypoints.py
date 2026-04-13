@@ -154,7 +154,6 @@ class ArmDrawImageAsWaypoints(Skill):
         Args:
         """
         image_path = "/home/jetson1/skills/draw_waypoints_utils/demo/patrick.png"
-        tracker_image_path = "/home/jetson1/skills/draw_waypoints_utils/demo/tracker.png"
         self.logger.info(f"Producing waypoints from image: {image_path}")
         actions = produce_waypoints(image_path)
         self.logger.info(f"Produced {len(actions)} actions from image")
@@ -182,7 +181,7 @@ class ArmDrawImageAsWaypoints(Skill):
         DOWN_YAW = 0.0
         DROP_HEIGHT = DOWN_Z
         
-        patrick_dim = 225
+        image_dim = img.shape[0] # Assuming square image, and shape[0] == shape[1]
         workspace_dim = 0.21 # m
 
         # while True:
@@ -202,10 +201,9 @@ class ArmDrawImageAsWaypoints(Skill):
                     0.0, 0.0, 0.0)
             elif action.action_type == ActionType.WAYPOINT:                
                 ## Actions are in pixel coordinates.
-                ## Patrick is 225 x 225
                 normalized_waypoint = Waypoint(
-                    x=action.waypoint.x / patrick_dim,  # Center at (0, 0)
-                    y=action.waypoint.y / patrick_dim
+                    x=action.waypoint.x / image_dim,  # Center at (0, 0)
+                    y=action.waypoint.y / image_dim
                 )
                 self.logger.info(f"Normalized waypoint: ({normalized_waypoint.x}, {normalized_waypoint.y})")
                 waypoint = Waypoint(
